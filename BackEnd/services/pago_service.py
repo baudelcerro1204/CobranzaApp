@@ -1,135 +1,159 @@
+import os
 import pandas as pd
-from models.pago import Pago
-from database.connection import get_db_connection
-from datetime import datetime
+import io
+import hashlib
 import logging
+from pydantic import ValidationError
 
-# Configuración del logger
+from database.connection import get_db_connection
+from models.schemas import PagoSchema
+from models.pago import Pago
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def process_excel(file):
-    # Leer el archivo Excel en memoria
-    df = pd.read_excel(file)
+def read_spreadsheet(file_input):
+    """
+    Acepta una ruta de archivo (str) o un FileStorage (de Flask).
+    Devuelve un DataFrame de pandas.
+    """
+    # Si es un FileStorage de Flask
+    if hasattr(file_input, "filename"):
+        filename = file_input.filename
+        ext = os.path.splitext(filename)[1].lower()
+        data = file_input.read()
+        buf = io.BytesIO(data)
 
-    # Normalizar los nombres de las columnas a minúsculas
-    df.columns = df.columns.str.lower()
+        if ext in (".xls", ".xlsx"):
+            return pd.read_excel(buf)
+        if ext == ".csv":
+            return pd.read_csv(buf)
+        if ext == ".ods":
+            return pd.read_excel(buf, engine="odf")
 
-    # Conectar a la base de datos
-    connection = get_db_connection()
-    cursor = connection.cursor()
+        raise ValueError(f"Formato no soportado: {ext}")
 
-    pagos_no_duplicados = []
+    # Si es una ruta en disco
+    ext = os.path.splitext(file_input)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        return pd.read_excel(file_input)
+    if ext == ".csv":
+        return pd.read_csv(file_input)
+    if ext == ".ods":
+        return pd.read_excel(file_input, engine="odf")
 
-    # Iterar sobre cada fila del DataFrame
-    for _, row in df.iterrows():
+    raise ValueError(f"Formato no soportado: {ext}")
+
+
+def get_existing_hashes():
+    """Carga todos los hashes de pagos ya en base de datos."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT dni, monto, empresa, fecha_pago, cuotas FROM pagos")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    hashes = set()
+    for dni, monto, empresa, fecha_pago, cuotas in rows:
+        raw = f"{str(dni).strip()}|{round(float(monto),2):.2f}|{str(empresa).strip()}|{fecha_pago or ''}|{cuotas or ''}"
+        hashes.add(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    return hashes
+
+
+def bulk_insert_pagos(cursor, pagos):
+    """Inserta en la base todos los pagos nuevos de una vez (incluye record_hash)."""
+    sql = """
+    INSERT INTO pagos
+      (dni, oponente, monto, empresa, fecha_pago, cuotas, record_hash)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    data = [p.to_tuple() for p in pagos]
+    cursor.executemany(sql, data)
+
+
+def process_file(file_input):
+    """
+    Procesa XLSX/CSV/ODS, saltea filas con monto nulo/NaN, valida con Pydantic,
+    evita duplicados y retorna lista de Pago.
+    """
+    df = read_spreadsheet(file_input)
+    df.columns = df.columns.str.lower().str.strip()
+
+    required = {"dni", "monto", "empresa"}
+    if not required.issubset(df.columns):
+        faltan = required - set(df.columns)
+        raise ValueError(f"Faltan columnas: {', '.join(faltan)}")
+
+    existing_hashes = get_existing_hashes()
+    logging.info(f"{len(existing_hashes)} pagos existentes cargados (por hash).")
+
+    nuevos = []
+    seen = set()
+
+    for idx, row in df.iterrows():
+        raw_monto = row.get("monto")
+        # 1) Skip si el monto es NaN, None o no es convertible a float
+        if pd.isna(raw_monto):
+            logging.info(f"Fila {idx} ignorada: monto nulo/NaN.")
+            continue
         try:
-            logging.info(f"Procesando fila con DNI: {row['dni']} y Monto: {row['monto']}")
+            monto_val = float(raw_monto)
+        except Exception:
+            logging.info(f"Fila {idx} ignorada: monto no numérico ({raw_monto}).")
+            continue
 
-            # Verificar si 'dni' o 'empresa' están vacíos (None o NaN)
-            if pd.isna(row['dni']) or pd.isna(row['empresa']):
-                logging.error(f"Faltan datos obligatorios (DNI o Empresa) en la fila con DNI: {row['dni']} y Empresa: {row['empresa']}")
-                connection.rollback()  # Cancelar toda la operación si hay datos faltantes en 'dni' o 'empresa'
-                return []
+        datos = {
+            "dni": str(row.get("dni")).strip(),
+            "monto": monto_val,
+            "empresa": row.get("empresa"),
+            "oponente": row.get("oponente", None),
+            "fecha_pago": row.get("fecha_de_pago", None),
+            "cuotas": row.get("cuotas", None),
+        }
+        try:
+            ps = PagoSchema(**datos)
+        except ValidationError as ve:
+            logging.warning(f"Fila {idx} inválida tras validación: {ve}")
+            continue
 
-            # Asignar None a 'fecha_pago' y 'cuotas' si están vacíos o NaN
-            fecha_pago = None if pd.isna(row.get('fecha_de_pago', None)) else row['fecha_de_pago']
-            cuotas = None if pd.isna(row.get('cuotas', None)) else row['cuotas']
+        h = ps.record_hash
+        if h in existing_hashes:
+            logging.info(f"Fila {idx} ya existe (hash duplicado).")
+            continue
+        if h in seen:
+            logging.info(f"Fila {idx} duplicada en archivo.")
+            continue
 
-            pago = Pago(
-                dni=row['dni'],
-                oponente=row.get('oponente', None),
-                monto=row['monto'],
-                empresa=row['empresa'],
-                fecha_pago=fecha_pago,
-                cuotas=cuotas
+        seen.add(h)
+        nuevos.append(
+            Pago(
+                dni=ps.dni,
+                oponente=ps.oponente,
+                monto=ps.monto,
+                empresa=ps.empresa,
+                fecha_pago=ps.fecha_pago,
+                cuotas=ps.cuotas,
+                record_hash=ps.record_hash,
             )
+        )
 
-            # Verificar si el pago ya existe en la base de datos
-            if not check_duplicate_payment(pago.dni, pago.monto, pago.empresa):
-                # Mostrar los datos antes de insertarlos
-                logging.info(f"Datos que se van a guardar: {pago.to_dict()}")
-                try:
-                    pago.save_to_db(cursor)
-                    pagos_no_duplicados.append(pago)
-                except Exception as e:
-                    logging.error(f"Error al guardar el pago con DNI: {pago.dni} y Monto: {pago.monto}. Error: {e}")
-                    connection.rollback()  # Si ocurre un error, revertir toda la transacción
-                    return []
+    logging.info(f"{len(nuevos)} pagos nuevos listos para insertar.")
+    if not nuevos:
+        logging.warning("No hay pagos nuevos.")
+        return []
 
-        except Exception as e:
-            logging.error(f"Error general al procesar la fila con DNI: {row['dni']}. Error: {e}")
-            connection.rollback()  # Si ocurre un error, revertir toda la transacción
-            return []
-
-    # Confirmar la transacción y cerrar la conexión
-    connection.commit()
-    cursor.close()
-    connection.close()
-
-    return pagos_no_duplicados
-
-
-
-
-
-def save_to_db(self, cursor):
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        # Asegurarse de que el DNI se maneje como texto
-        dni_text = str(self.dni)
-
-        # Asegurarse de que 'fecha_pago' y 'cuotas' sean None si no tienen valor
-        fecha_pago = None if self.fecha_pago is None or pd.isna(self.fecha_pago) else self.fecha_pago
-        cuotas = None if self.cuotas is None or pd.isna(self.cuotas) else self.cuotas
-
-        # Mostrar los datos antes de la inserción
-        logging.info(f"Intentando insertar el pago con los siguientes datos:")
-        logging.info(f"DNI: {dni_text}, Oponente: {self.oponente}, Monto: {self.monto}, Empresa: {self.empresa}, Fecha de pago: {fecha_pago}, Cuotas: {cuotas}")
-
-        # Insertar los datos en la base de datos
-        cursor.execute("""
-            INSERT INTO pagos (dni, oponente, monto, empresa, fecha_pago, cuotas)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (dni_text, self.oponente, self.monto, self.empresa, fecha_pago, cuotas))
-
-        logging.info(f"Pago insertado correctamente con DNI: {dni_text} y Monto: {self.monto}")
+        bulk_insert_pagos(cur, nuevos)
+        conn.commit()
+        logging.info("Pagos insertados exitosamente.")
     except Exception as e:
-        logging.error(f"Error al intentar guardar el pago con DNI: {self.dni} y Monto: {self.monto}. Error: {e}")
-        raise  # Vuelve a lanzar la excepción después de loguearla
+        conn.rollback()
+        logging.error(f"Error al insertar pagos: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
-
-
-
-
-def check_duplicate_payment(dni, monto, empresa):
-    """
-    Verifica si hay pagos duplicados en la base de datos.
-    :param dni: DNI del pago
-    :param monto: Monto del pago
-    :param empresa: Empresa asociada al pago
-    :return: True si el pago ya existe, False si no
-    """
-    connection = get_db_connection()
-    cursor = connection.cursor()
-
-    # Convertir `dni` a texto explícitamente
-    cursor.execute("""
-        SELECT 1 FROM pagos WHERE dni = %s AND monto = %s AND empresa = %s
-    """, (str(dni), monto, empresa))  # Convertimos `dni` a string (TEXT)
-
-    result = cursor.fetchone()
-    cursor.close()
-    connection.close()
-
-    return result is not None
-
-
-def check_valid_range(dni, monto):
-    # Validar rango del dni (debe ser un número dentro del rango de INTEGER)
-    if not (0 <= dni <= 2147483647):
-        raise ValueError(f"DNI {dni} fuera del rango permitido para INTEGER.")
-    
-    # Validar rango del monto (debe estar dentro del rango de INTEGER)
-    if not (-2147483648 <= monto <= 2147483647):
-        raise ValueError(f"Monto {monto} fuera del rango permitido para INTEGER.")
-    
-    return True
+    return nuevos
